@@ -215,9 +215,12 @@ pub(crate) struct VideoStream {
 	frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
 	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+	/// DRM render node the encoder must run on (matches the compositor's GPU).
+	render_node: Option<std::path::PathBuf>,
 }
 
 impl VideoStream {
+	#[allow(clippy::too_many_arguments)]
 	pub async fn new(
 		config: VideoStreamConfig,
 		address: String,
@@ -225,6 +228,7 @@ impl VideoStream {
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		_stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		render_node: Option<std::path::PathBuf>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video stream.");
 
@@ -244,6 +248,7 @@ impl VideoStream {
 			frame_rx,
 			hdr_metadata_tx,
 			stats_tx,
+			render_node,
 		})
 	}
 
@@ -260,6 +265,7 @@ impl VideoStream {
 			frame_rx,
 			hdr_metadata_tx,
 			stats_tx,
+			render_node,
 		} = self;
 
 		// Apply QoS to UDP socket.
@@ -295,6 +301,7 @@ impl VideoStream {
 			hdr_metadata_tx,
 			start_notify.clone(),
 			stats_tx,
+			render_node,
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 

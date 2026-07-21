@@ -18,4 +18,9 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "signal", "sync", "
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+# Local patch: pixelforge with DRM-render-node device selection so the encoder
+# runs on the same physical GPU as the compositor. See ../pixelforge-patched.
+[patch."https://github.com/hgaiser/pixelforge"]
+pixelforge = { path = "../pixelforge-patched" }
+
 

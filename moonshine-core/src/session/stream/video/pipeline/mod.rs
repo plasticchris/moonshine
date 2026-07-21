@@ -169,6 +169,7 @@ impl VideoPipeline {
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		render_node: Option<std::path::PathBuf>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -176,6 +177,7 @@ impl VideoPipeline {
 			config,
 			context,
 			keys_rx,
+			render_node,
 		};
 
 		std::thread::Builder::new()
@@ -202,6 +204,8 @@ struct VideoPipelineInner {
 	config: VideoStreamConfig,
 	context: VideoStreamContext,
 	keys_rx: SessionKeysReceiver,
+	/// DRM render node the encoder's Vulkan device must match (the compositor's GPU).
+	render_node: Option<std::path::PathBuf>,
 }
 
 impl VideoPipelineInner {
@@ -261,8 +265,10 @@ impl VideoPipelineInner {
 	fn create_encoder(&self) -> Result<(VideoContext, Encoder), String> {
 		let ctx = &self.context;
 
-		// Create Vulkan video context.
+		// Create Vulkan video context, pinned to the compositor's GPU so the
+		// exported DMA-BUFs are imported and encoded on the same physical device.
 		let context = VideoContextBuilder::new()
+			.drm_render_node(self.render_node.clone())
 			.build()
 			.map_err(|e| format!("Failed to create video context: {e}"))?;
 

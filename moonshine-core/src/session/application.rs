@@ -47,6 +47,14 @@ pub struct ApplicationConfig {
 	/// Seconds to wait for the application to reach an active state after launch.
 	#[serde(default = "default_launch_timeout")]
 	pub launch_timeout_secs: u64,
+
+	/// GPU to run this application's session on. Accepts a DRM render node path
+	/// (`/dev/dri/renderD128`), a `renderDXXX` name, or a PCI/uevent substring.
+	/// Falls back to `compositor.gpu` when unset. Both the compositor and the
+	/// video encoder are pinned to the resolved GPU, so different applications
+	/// can target different GPUs.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub gpu: Option<String>,
 }
 
 impl Default for ApplicationConfig {
@@ -60,6 +68,7 @@ impl Default for ApplicationConfig {
 			stdout: None,
 			stderr: None,
 			launch_timeout_secs: default_launch_timeout(),
+			gpu: None,
 		}
 	}
 }

@@ -139,7 +139,7 @@ pub(crate) struct InitializedSession {
 impl InitializedSession {
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) async fn new(
-		compositor_config: CompositorConfig,
+		mut compositor_config: CompositorConfig,
 		video_config: VideoStreamConfig,
 		audio_config: AudioStreamConfig,
 		control_config: ControlStreamConfig,
@@ -148,6 +148,25 @@ impl InitializedSession {
 		stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	) -> Result<Self, ()> {
+		// Resolve the GPU render node once for this session. The compositor and the
+		// video encoder must run on the *same* physical GPU — importing a DMA-BUF
+		// allocated on one GPU into an encoder on another corrupts the frame. The
+		// per-application `gpu` overrides the compositor default, so different
+		// applications can target different GPUs.
+		let gpu_selector = context
+			.application
+			.gpu
+			.clone()
+			.or_else(|| compositor_config.gpu.clone());
+		let render_node = crate::session::compositor::find_render_node(&gpu_selector)
+			.map_err(|e| tracing::warn!("Failed to resolve GPU render node: {e}"))
+			.ok();
+		if let Some(node) = &render_node {
+			tracing::info!("Session pinned to GPU render node {}", node.display());
+			// Force the compositor onto the resolved node so it matches the encoder.
+			compositor_config.gpu = Some(node.to_string_lossy().into_owned());
+		}
+
 		// Create HDR metadata watch channel.
 		let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState::new(context.hdr));
 
@@ -161,6 +180,7 @@ impl InitializedSession {
 			hdr_metadata_tx,
 			stop.clone(),
 			stats_tx,
+			render_node,
 		)
 		.await?;
 		let control_stream = ControlStream::new(control_config, address, handles.input_tx, stop.clone())?;

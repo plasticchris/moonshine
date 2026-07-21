@@ -491,7 +491,7 @@ fn run_compositor(
 }
 
 /// Find the appropriate DRM render node.
-fn find_render_node(gpu_config: &Option<String>) -> Result<std::path::PathBuf, String> {
+pub(crate) fn find_render_node(gpu_config: &Option<String>) -> Result<std::path::PathBuf, String> {
 	// Check environment variable override first.
 	if let Ok(node) = std::env::var("MOONSHINE_RENDER_NODE") {
 		return Ok(std::path::PathBuf::from(node));
