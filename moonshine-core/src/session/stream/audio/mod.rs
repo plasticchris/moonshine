@@ -198,6 +198,8 @@ pub(crate) struct AudioStream {
 	pulse_socket: UnixListener,
 	pub pulse_socket_path: PathBuf,
 	udp_socket: tokio::net::UdpSocket,
+	/// Actual bound UDP port (resolved when binding to port 0 for multi-seat).
+	local_port: u16,
 	stop: ShutdownManager<SessionShutdownReason>,
 }
 
@@ -205,6 +207,7 @@ impl AudioStream {
 	pub async fn new(
 		config: AudioStreamConfig,
 		address: String,
+		session_id: u64,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing audio stream.");
@@ -212,11 +215,16 @@ impl AudioStream {
 		let udp_socket = UdpSocket::bind((address, config.port))
 			.await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
+		let local_port = udp_socket
+			.local_addr()
+			.map_err(|e| tracing::warn!("Failed to get local address associated with audio socket: {e}"))?
+			.port();
 
-		// Create the socket directory for the PulseAudio server.
+		// Per-session PulseAudio socket directory so concurrent sessions don't
+		// collide on a single shared socket path.
 		let pulse_socket_dir = dirs::runtime_dir()
 			.ok_or_else(|| tracing::error!("Failed to get runtime directory for PulseAudio socket"))?
-			.join("moonshine/pulse");
+			.join(format!("moonshine/pulse/{session_id}"));
 		std::fs::create_dir_all(&pulse_socket_dir)
 			.map_err(|e| tracing::error!("Failed to create pulse socket directory: {e}"))?;
 		let pulse_socket_path = pulse_socket_dir.join("native");
@@ -235,8 +243,14 @@ impl AudioStream {
 			pulse_socket,
 			pulse_socket_path,
 			udp_socket,
+			local_port,
 			stop,
 		})
+	}
+
+	/// Actual bound UDP port, reported to the client via RTSP SETUP.
+	pub fn local_port(&self) -> u16 {
+		self.local_port
 	}
 
 	pub fn start(self, context: AudioStreamContext, keys_rx: SessionKeysReceiver) -> Result<AudioStartHandle, ()> {

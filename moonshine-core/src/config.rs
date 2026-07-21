@@ -37,6 +37,25 @@ pub struct Config {
 
 	/// Configuration for the compositor.
 	pub compositor: CompositorConfig,
+
+	/// Optional user layer: groups device identities under a logical user so one
+	/// person's multiple Moonlight devices share a single seat identity (and thus
+	/// one `{owner}` HOME / Steam profile). Omit for device-pinned behavior.
+	#[serde(rename = "user", default, skip_serializing_if = "Vec::is_empty")]
+	pub users: Vec<UserConfig>,
+}
+
+/// Maps one or more device identities to a single logical user. A device is
+/// identified by its mTLS certificate fingerprint (SHA-256 hex, logged on
+/// launch) or, on the unprotected HTTP path, its Moonlight `uniqueid`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UserConfig {
+	/// Logical user id, used as the seat owner and the `{owner}` HOME component.
+	pub name: String,
+
+	/// Device identities (cert fingerprints and/or `uniqueid`s) for this user.
+	#[serde(default)]
+	pub devices: Vec<String>,
 }
 
 impl Config {
@@ -120,6 +139,7 @@ impl Default for Config {
 				launch_timeout_secs: 2,
 			})],
 			compositor: CompositorConfig::default(),
+			users: Vec::new(),
 		}
 	}
 }

@@ -245,6 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 			..Default::default()
 		},
 		"127.0.0.1".to_string(),
+		0,
 		60,
 		shutdown.clone(),
 	)
@@ -270,6 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		audio_channels: AudioChannels::Stereo,
 		audio_channel_mask: 0x3,
 		hdr: args.hdr,
+		seat_home: None,
 	};
 
 	tracing::info!("Initializing session...");

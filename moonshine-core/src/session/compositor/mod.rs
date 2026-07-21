@@ -61,7 +61,35 @@ impl Default for KeyboardConfig {
 #[serde(default)]
 pub struct CompositorConfig {
 	/// Optional GPU device identifier for compositor rendering.
+	///
+	/// Used for single-seat operation and as the default when `gpus` is empty.
 	pub gpu: Option<String>,
+
+	/// GPU pool for concurrent multi-seat streaming. Each entry is a DRM render
+	/// node selector (`/dev/dri/renderD128`, a `renderDXXX` name, or a PCI/uevent
+	/// substring). When non-empty, Moonshine hosts up to `gpus.len()` concurrent
+	/// sessions, each pinned to a distinct free GPU, with OS-ephemeral ports.
+	/// When empty, Moonshine runs a single session on `gpu` with fixed config ports.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub gpus: Vec<String>,
+
+	/// Per-seat `HOME` template for multi-seat mode. When set, each session's
+	/// application runs with `HOME` (and `XDG_{DATA,CONFIG,CACHE,STATE}_HOME`)
+	/// redirected under this path, giving single-instance apps like Steam an
+	/// isolated profile per concurrent seat. Placeholders: `{owner}` = the client
+	/// identity (profile follows the person across whichever GPU is free);
+	/// `{seat}` = the GPU pool slot (0-based, hardware-tied). Omit to share the
+	/// real `HOME`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub seat_home_template: Option<String>,
+
+	/// Existing Steam library folders to register in every new seat's HOME (only
+	/// used with `seat_home_template`). Each fresh seat's `libraryfolders.vdf` is
+	/// seeded with these paths so already-installed games launch without being
+	/// re-downloaded into the seat. Point at a shared library like
+	/// `/mnt/scratch/SteamLibrary`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub seat_steam_libraries: Vec<String>,
 
 	/// Whether to enable HDR mode in the compositor if the client supports it.
 	pub hdr: bool,
@@ -74,6 +102,9 @@ impl Default for CompositorConfig {
 	fn default() -> Self {
 		Self {
 			gpu: None,
+			gpus: Vec::new(),
+			seat_home_template: None,
+			seat_steam_libraries: Vec::new(),
 			hdr: true,
 			keyboard: KeyboardConfig::default(),
 		}

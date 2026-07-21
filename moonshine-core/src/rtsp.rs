@@ -1,7 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
-use async_shutdown::ShutdownManager;
 use rtsp_types::headers;
 use rtsp_types::headers::Transport;
 use rtsp_types::Method;
@@ -13,16 +12,14 @@ use tokio::net::TcpStream;
 use crate::session::manager::SessionManager;
 use crate::session::stream::audio::AudioChannels;
 use crate::session::stream::audio::AudioConfig;
-use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::audio::ALL_AUDIO_CONFIGS;
-use crate::session::stream::control::ControlStreamConfig;
 use crate::session::stream::video::VideoChromaSampling;
 use crate::session::stream::video::VideoDynamicRange;
 use crate::session::stream::video::VideoFormat;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
-use crate::ShutdownReason;
+use crate::session::StreamPorts;
 
 #[repr(u8)]
 enum ServerCapabilities {
@@ -37,80 +34,89 @@ enum EncryptionFlags {
 	Audio = 0x04,
 }
 
+/// Per-session RTSP server.
+///
+/// Each streaming seat gets its own `RtspServer` bound to an OS-ephemeral TCP
+/// port (reported to the client via `sessionUrl0`). SETUP responses report the
+/// session's live UDP ports (`StreamPorts`), which are also ephemeral for
+/// multi-seat, so several concurrent sessions coexist on one IP.
 #[derive(Clone)]
 pub struct RtspServer {
-	address: String,
-	rtsp_port: u16,
+	ports: StreamPorts,
 	video_config: VideoStreamConfig,
-	audio_config: AudioStreamConfig,
-	control_config: ControlStreamConfig,
 	session_manager: SessionManager,
 }
 
 impl RtspServer {
-	pub fn new(
+	/// Bind a per-session RTSP server and start accepting connections.
+	///
+	/// Binds `address:bind_port` (`bind_port` 0 → OS-ephemeral) synchronously so
+	/// the actual TCP port can be returned immediately, then spawns the accept
+	/// loop. The loop is cancelled when `cancel` resolves (the session's shutdown),
+	/// releasing the port.
+	pub(crate) async fn start<F>(
 		address: String,
-		rtsp_port: u16,
+		bind_port: u16,
+		ports: StreamPorts,
 		video_config: VideoStreamConfig,
-		audio_config: AudioStreamConfig,
-		control_config: ControlStreamConfig,
 		session_manager: SessionManager,
-		shutdown: ShutdownManager<ShutdownReason>,
-	) -> Self {
+		cancel: F,
+	) -> Result<(Self, u16), ()>
+	where
+		F: std::future::Future<Output = ()> + Send + 'static,
+	{
+		let ip = address
+			.parse::<IpAddr>()
+			.map_err(|e| tracing::error!("Failed to parse address '{}': {}", address, e))?;
+		let socket_addr = SocketAddr::new(ip, bind_port);
+		let listener = TcpListener::bind(socket_addr)
+			.await
+			.map_err(|e| tracing::error!("Failed to bind to address {}: {}", socket_addr, e))?;
+		let rtsp_port = listener
+			.local_addr()
+			.map_err(|e| tracing::error!("Failed to get local RTSP address: {e}"))?
+			.port();
+
+		tracing::debug!("RTSP server listening on {}:{rtsp_port}", ip);
+
 		let server = Self {
-			address,
-			rtsp_port,
-			video_config: video_config.clone(),
-			audio_config: audio_config.clone(),
-			control_config: control_config.clone(),
+			ports,
+			video_config,
 			session_manager,
 		};
 
 		tokio::spawn({
 			let server = server.clone();
 			async move {
-				let _ = shutdown
-					.wrap_cancel(shutdown.wrap_trigger_shutdown(ShutdownReason::RtspShutdown, {
-						let server = server.clone();
-						async move {
-							let ip = server
-								.address
-								.parse::<IpAddr>()
-								.map_err(|e| tracing::error!("Failed to parse address '{}': {}", server.address, e))?;
-							let socket_addr = SocketAddr::new(ip, server.rtsp_port);
-							let listener = TcpListener::bind(socket_addr)
-								.await
-								.map_err(|e| tracing::error!("Failed to bind to address {}: {}", socket_addr, e))?;
-
-							tracing::debug!("RTSP server listening on {}", socket_addr);
-
-							loop {
-								let (connection, address) = listener
-									.accept()
-									.await
-									.map_err(|e| tracing::error!("Failed to accept connection: {}", e))?;
-								tracing::trace!("Accepted connection from {}", address);
-
-								tokio::spawn({
-									let server = server.clone();
-									async move {
-										let _ = server.handle_connection(connection, address).await;
-									}
-								});
+				tokio::pin!(cancel);
+				loop {
+					tokio::select! {
+						_ = &mut cancel => break,
+						accepted = listener.accept() => {
+							match accepted {
+								Ok((connection, address)) => {
+									tracing::trace!("Accepted connection from {}", address);
+									tokio::spawn({
+										let server = server.clone();
+										async move {
+											let _ = server.handle_connection(connection, address).await;
+										}
+									});
+								},
+								Err(e) => {
+									tracing::error!("Failed to accept RTSP connection: {}", e);
+									break;
+								},
 							}
-
-							// Is there another way to define the return type of this function?
-							#[allow(unreachable_code)]
-							Ok::<(), ()>(())
-						}
-					}))
-					.await;
+						},
+					}
+				}
 
 				tracing::debug!("RTSP server shutting down.");
 			}
 		});
 
-		server
+		Ok((server, rtsp_port))
 	}
 
 	fn capabilities(&self) -> u8 {
@@ -225,9 +231,9 @@ impl RtspServer {
 
 					// Example query: streamid=control/13/0
 					let (stream_id, port) = match query.1.split('/').next() {
-						Some("video") => ("video", self.video_config.port),
-						Some("audio") => ("audio", self.audio_config.port),
-						Some("control") => ("control", self.control_config.port),
+						Some("video") => ("video", self.ports.video),
+						Some("audio") => ("audio", self.ports.audio),
+						Some("control") => ("control", self.ports.control),
 						Some(stream) => {
 							tracing::warn!("Unknown stream '{stream}'");
 							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);

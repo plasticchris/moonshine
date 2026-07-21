@@ -212,6 +212,8 @@ impl VideoStreamHandle {
 
 pub(crate) struct VideoStream {
 	socket: UdpSocket,
+	/// Actual bound UDP port (resolved when binding to port 0 for multi-seat).
+	local_port: u16,
 	frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
 	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
@@ -236,20 +238,25 @@ impl VideoStream {
 			.await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 
-		tracing::debug!(
-			"Listening for video messages on {}",
-			socket
-				.local_addr()
-				.map_err(|e| tracing::warn!("Failed to get local address associated with video socket: {e}"))?
-		);
+		let local_port = socket
+			.local_addr()
+			.map_err(|e| tracing::warn!("Failed to get local address associated with video socket: {e}"))?
+			.port();
+		tracing::debug!("Listening for video messages on {}:{local_port}", address);
 
 		Ok(Self {
 			socket,
+			local_port,
 			frame_rx,
 			hdr_metadata_tx,
 			stats_tx,
 			render_node,
 		})
+	}
+
+	/// Actual bound UDP port, reported to the client via RTSP SETUP.
+	pub fn local_port(&self) -> u16 {
+		self.local_port
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -262,6 +269,7 @@ impl VideoStream {
 	) -> Result<VideoStreamHandle, ()> {
 		let Self {
 			socket,
+			local_port: _,
 			frame_rx,
 			hdr_metadata_tx,
 			stats_tx,

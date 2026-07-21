@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
@@ -28,6 +29,7 @@ use self::stream::video::VideoStreamConfig;
 pub mod application;
 pub mod compositor;
 pub mod manager;
+pub mod pool;
 pub mod stream;
 
 /// Timeout in seconds for the HTTP launch endpoint to wait for the session to launch.
@@ -99,6 +101,12 @@ pub struct SessionContext {
 
 	/// If true, the compositor will be launched with HDR support.
 	pub hdr: bool,
+
+	/// Server-assigned per-seat `HOME` for multi-seat isolation. When set, the
+	/// application is launched with `HOME`/`XDG_*` redirected here so
+	/// single-instance apps (e.g. Steam) get an isolated profile per seat.
+	/// `None` shares the real `HOME` (single-seat, or when unconfigured).
+	pub seat_home: Option<PathBuf>,
 }
 
 /// The state of the session. This enum enforces the session lifecycle:
@@ -125,13 +133,24 @@ impl SessionState {
 	}
 }
 
+/// Live UDP ports bound by the video/audio/control streams, reported to the
+/// client via RTSP SETUP so ephemeral (port 0) bindings work for multi-seat.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StreamPorts {
+	pub video: u16,
+	pub audio: u16,
+	pub control: u16,
+}
+
 /// Initialized session state — components created, compositor and app not yet started.
 pub(crate) struct InitializedSession {
 	context: SessionContext,
+	session_id: u64,
 	compositor: Compositor,
 	audio_stream: AudioStream,
 	video_stream: VideoStream,
 	control_stream: ControlStream,
+	ports: StreamPorts,
 	hdr_metadata_rx: watch::Receiver<HdrModeState>,
 	stop: ShutdownManager<SessionShutdownReason>,
 }
@@ -144,6 +163,7 @@ impl InitializedSession {
 		audio_config: AudioStreamConfig,
 		control_config: ControlStreamConfig,
 		address: String,
+		session_id: u64,
 		context: SessionContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
@@ -172,7 +192,7 @@ impl InitializedSession {
 
 		// Create compositor, audio stream, video stream, and control stream.
 		let (compositor, handles) = Compositor::new(compositor_config, (&context).into(), stop.clone());
-		let audio = AudioStream::new(audio_config, address.clone(), stop.clone()).await?;
+		let audio = AudioStream::new(audio_config, address.clone(), session_id, stop.clone()).await?;
 		let video_stream = VideoStream::new(
 			video_config.clone(),
 			address.clone(),
@@ -185,12 +205,20 @@ impl InitializedSession {
 		.await?;
 		let control_stream = ControlStream::new(control_config, address, handles.input_tx, stop.clone())?;
 
+		let ports = StreamPorts {
+			video: video_stream.local_port(),
+			audio: audio.local_port(),
+			control: control_stream.local_port(),
+		};
+
 		Ok(Self {
 			context,
+			session_id,
 			compositor,
 			audio_stream: audio,
 			video_stream,
 			control_stream,
+			ports,
 			hdr_metadata_rx,
 			stop,
 		})
@@ -200,14 +228,20 @@ impl InitializedSession {
 		&self.context
 	}
 
+	pub(crate) fn ports(&self) -> StreamPorts {
+		self.ports
+	}
+
 	/// Launch the session — starts the compositor and application, but does not start streams.
 	pub(crate) async fn launch(self) -> Result<LaunchedSession, ()> {
 		let Self {
 			context,
+			session_id,
 			compositor,
 			audio_stream: audio,
 			video_stream,
 			control_stream,
+			ports: _,
 			hdr_metadata_rx,
 			stop,
 		} = self;
@@ -219,11 +253,13 @@ impl InitializedSession {
 		let application = Application::spawn(
 			context.application.clone(),
 			ApplicationContext {
-				unit_name: "moonshine-session.service".to_string(),
+				// Per-session unit name so concurrent seats don't share one systemd unit.
+				unit_name: format!("moonshine-session-{session_id}.service"),
 				pulse_socket_path,
 				xdisplay: ready.xdisplay,
 				wayland_display: ready.wayland_display.clone(),
 				hdr: ready.hdr,
+				seat_home: context.seat_home.clone(),
 			},
 			stop,
 		)

@@ -120,6 +120,9 @@ pub(crate) struct ApplicationContext {
 	pub wayland_display: String,
 	/// Effective HDR mode — `true` only when the compositor confirmed an HDR-capable DMA-BUF format is in use.
 	pub hdr: bool,
+	/// Per-seat `HOME` for multi-seat isolation. When set, `HOME` and the XDG
+	/// base dirs are redirected here so single-instance apps get their own profile.
+	pub seat_home: Option<PathBuf>,
 }
 
 pub(crate) struct Application {
@@ -229,6 +232,28 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 		// surface formats correctly (the factory global is always present for
 		// SDR sessions too, so we need an explicit capability signal).
 		envs.push("MOONSHINE_HDR=1".to_string());
+	}
+
+	if let Some(home) = &context.seat_home {
+		// Redirect HOME and the XDG base dirs so single-instance apps (Steam)
+		// get an isolated profile per seat. XDG_RUNTIME_DIR is left shared on
+		// purpose: the wayland/pulse sockets live there and are passed explicitly.
+		let home = home.to_string_lossy().into_owned();
+		for dir in [
+			home.clone(),
+			format!("{home}/.local/share"),
+			format!("{home}/.config"),
+			format!("{home}/.cache"),
+			format!("{home}/.local/state"),
+		] {
+			std::fs::create_dir_all(&dir)
+				.map_err(|e| tracing::error!("Failed to create seat HOME dir {dir}: {e}"))?;
+		}
+		envs.push(format!("HOME={home}"));
+		envs.push(format!("XDG_DATA_HOME={home}/.local/share"));
+		envs.push(format!("XDG_CONFIG_HOME={home}/.config"));
+		envs.push(format!("XDG_CACHE_HOME={home}/.cache"));
+		envs.push(format!("XDG_STATE_HOME={home}/.local/state"));
 	}
 
 	Ok(envs)

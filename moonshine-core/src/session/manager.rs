@@ -16,6 +16,7 @@ use crate::session::SessionKeyData;
 use crate::session::SessionKeys;
 use crate::session::SessionKeysSender;
 use crate::session::SessionState;
+use crate::session::StreamPorts;
 use crate::ShutdownReason;
 
 const SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
@@ -62,11 +63,19 @@ struct SessionManagerInner {
 	/// Address to bind streams to.
 	address: String,
 
+	/// Unique id for this session/seat, used to derive per-session resource
+	/// names (PulseAudio socket path, systemd unit) so concurrent seats don't collide.
+	session_id: u64,
+
 	/// Time in seconds since last ping after which the stream closes.
 	stream_timeout: u64,
 
 	/// The currently active session, if any.
 	session: Option<SessionState>,
+
+	/// Live UDP ports bound by the current session's streams, reported to the
+	/// client via RTSP SETUP. Set during `initialize_session`.
+	stream_ports: Option<StreamPorts>,
 
 	/// Shutdown manager for the active session, used to trigger session shutdown upon request.
 	stop: ShutdownManager<SessionShutdownReason>,
@@ -95,14 +104,11 @@ struct SessionManagerInner {
 	/// Shutdown manager for the entire application.
 	shutdown: ShutdownManager<ShutdownReason>,
 
-	/// Trigger token for the session manager's own shutdown trigger.
-	///
-	/// Used to trigger an application shutdown if the session manager stops unexpectedly.
-	_trigger_token: async_shutdown::TriggerShutdownToken<ShutdownReason>,
-
 	/// Delay token for the session manager's own shutdown trigger.
 	///
-	/// Used to delay shutdown until the session manager has cleaned up.
+	/// Delays global shutdown until this session has cleaned up. Note: unlike the
+	/// single-seat design, a pooled session manager holds *no* global trigger token —
+	/// a finished seat must not shut down the whole process.
 	_delay_token: async_shutdown::DelayShutdownToken<ShutdownReason>,
 }
 
@@ -112,6 +118,7 @@ impl SessionManagerInner {
 			handle.abort();
 		}
 		self.session = None;
+		self.stream_ports = None;
 		self.keys_tx = None;
 		self.video_stream_context = None;
 		self.audio_stream_context = None;
@@ -129,10 +136,17 @@ impl Drop for SessionManagerInner {
 		if self.session.is_some() {
 			tracing::debug!("Stopping active session before shutdown.");
 			let _ = self.stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown);
-			// Wait until shutdown completed.
-			if let Ok(handle) = tokio::runtime::Handle::try_current() {
-				handle.block_on(self.stop.wait_shutdown_complete());
-			}
+			// Wait until shutdown completes. Run the wait on a dedicated thread so this
+			// works whether or not we're dropped inside a tokio runtime context — a
+			// pooled session manager can be dropped from an async task when a seat ends,
+			// where `Handle::block_on` would panic.
+			let stop = self.stop.clone();
+			std::thread::spawn(move || {
+				let rt = tokio::runtime::Runtime::new().unwrap();
+				rt.block_on(stop.wait_shutdown_complete());
+			})
+			.join()
+			.ok();
 		}
 	}
 }
@@ -141,6 +155,7 @@ impl Drop for SessionManagerInner {
 pub struct SessionManager {
 	inner: Arc<Mutex<SessionManagerInner>>,
 	stats_tx: broadcast::Sender<FrameStats>,
+	session_id: u64,
 }
 
 impl SessionManager {
@@ -151,10 +166,10 @@ impl SessionManager {
 		audio_config: AudioStreamConfig,
 		control_config: ControlStreamConfig,
 		address: String,
+		session_id: u64,
 		stream_timeout: u64,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
-		let trigger_token = shutdown.trigger_shutdown_token(ShutdownReason::SessionManagerShutdown);
 		let delay_token = shutdown.delay_shutdown_token().map_err(|e| {
 			tracing::error!("Failed to create delay shutdown token: {e:?}");
 		})?;
@@ -165,8 +180,10 @@ impl SessionManager {
 			audio_config,
 			control_config,
 			address,
+			session_id,
 			stream_timeout,
 			session: None,
+			stream_ports: None,
 			stop: ShutdownManager::new(),
 			keys_tx: None,
 			video_stream_context: None,
@@ -176,14 +193,17 @@ impl SessionManager {
 			video_start_notify: None,
 			audio_start_notify: None,
 			shutdown: shutdown.clone(),
-			_trigger_token: trigger_token,
 			_delay_token: delay_token,
 		};
 
 		let stats_tx = inner.stats_tx.clone();
 		let inner = Arc::new(Mutex::new(inner));
 
-		Ok(Self { inner, stats_tx })
+		Ok(Self {
+			inner,
+			stats_tx,
+			session_id,
+		})
 	}
 
 	/// Returns a receiver for per-frame encoding statistics.
@@ -248,6 +268,30 @@ impl SessionManager {
 		Ok(guard.session.as_ref().map(|s| s.context().clone()))
 	}
 
+	/// Unique id for this session/seat.
+	pub fn session_id(&self) -> u64 {
+		self.session_id
+	}
+
+	/// Live UDP ports bound by the current session's streams, if initialized.
+	pub(crate) async fn stream_ports(&self) -> Option<StreamPorts> {
+		self.inner.lock().await.stream_ports
+	}
+
+	/// Clone the current session's shutdown manager. Used by the pool to bind a
+	/// per-session RTSP server's lifetime and to await session end.
+	pub(crate) async fn session_stop(&self) -> ShutdownManager<SessionShutdownReason> {
+		self.inner.lock().await.stop.clone()
+	}
+
+	/// Resolve once the current session has fully shut down (all components
+	/// released). Used by the pool to free the GPU/port slot when a session ends
+	/// (either by user cancel or unexpected application exit).
+	pub(crate) async fn wait_session_end(&self) {
+		let stop = self.inner.lock().await.stop.clone();
+		stop.wait_shutdown_complete().await;
+	}
+
 	/// Initialize a new session with the provided context.
 	///
 	/// The session is not launched until `launch_session` is called.
@@ -275,6 +319,7 @@ impl SessionManager {
 		let audio_config = guard.audio_config.clone();
 		let control_config = guard.control_config.clone();
 		let address = guard.address.clone();
+		let session_id = guard.session_id;
 		let stop = guard.stop.clone();
 		let stats_tx = guard.stats_tx.clone();
 		let session = InitializedSession::new(
@@ -283,11 +328,13 @@ impl SessionManager {
 			audio_config,
 			control_config,
 			address,
+			session_id,
 			context,
 			stop,
 			stats_tx,
 		)
 		.await?;
+		guard.stream_ports = Some(session.ports());
 		guard.session = Some(SessionState::Initialized(session));
 
 		spawn_session_watchdog(&self.inner, &mut guard);

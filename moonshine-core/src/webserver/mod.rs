@@ -26,8 +26,10 @@ use tokio::net::TcpListener;
 use crate::{
 	clients::ClientManager,
 	session::{
-		application::ApplicationConfig, compositor::CompositorConfig, manager::SessionManager, SessionContext,
-		SessionKeyData, SessionKeys, APP_LAUNCH_HTTP_TIMEOUT_SECS,
+		application::ApplicationConfig,
+		compositor::CompositorConfig,
+		pool::{LaunchError, SessionPool},
+		SessionContext, SessionKeyData, SessionKeys,
 	},
 	tls::TlsAcceptor,
 	ShutdownReason,
@@ -97,14 +99,16 @@ enum ServerCodecModeSupport {
 #[derive(Clone)]
 pub struct Webserver {
 	name: String,
-	rtsp_port: u16,
 	webserver_config: WebserverConfig,
 	applications: Vec<ApplicationConfig>,
 	unique_id: String,
 	client_manager: ClientManager,
-	session_manager: SessionManager,
+	session_pool: SessionPool,
 	server_certs: String,
 	hdr_supported: bool,
+	/// Device identity (cert fingerprint or `uniqueid`) -> logical user, so one
+	/// user's multiple devices resolve to a single seat owner / HOME.
+	user_map: HashMap<String, String>,
 	shutdown: ShutdownManager<ShutdownReason>,
 }
 
@@ -114,7 +118,6 @@ impl Webserver {
 	pub fn new(
 		name: String,
 		address: String,
-		rtsp_port: u16,
 		webserver_config: WebserverConfig,
 		applications: Vec<ApplicationConfig>,
 		compositor_config: CompositorConfig,
@@ -122,23 +125,40 @@ impl Webserver {
 		// Passing certificate content as string.
 		server_certs: String,
 		client_manager: ClientManager,
-		session_manager: SessionManager,
+		session_pool: SessionPool,
+		users: Vec<crate::config::UserConfig>,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
 		// Gate HDR advertisement on both the config flag and a runtime
 		// GPU capability probe (10-bit or FP16 render formats).
 		let hdr_supported = compositor_config.hdr && super::session::compositor::probe_hdr_support(&compositor_config);
 
+		// Reverse index: each listed device identity -> its user. A device may
+		// only belong to one user; later entries win with a warning.
+		let mut user_map: HashMap<String, String> = HashMap::new();
+		for user in &users {
+			for device in &user.devices {
+				if let Some(prev) = user_map.insert(device.clone(), user.name.clone()) {
+					if prev != user.name {
+						tracing::warn!("Device '{device}' mapped to both '{prev}' and '{}'; using '{}'.", user.name, user.name);
+					}
+				}
+			}
+		}
+		if !user_map.is_empty() {
+			tracing::info!("User layer: {} device(s) mapped across {} user(s).", user_map.len(), users.len());
+		}
+
 		let server = Self {
 			name,
-			rtsp_port,
 			webserver_config,
 			applications,
 			unique_id,
 			client_manager,
-			session_manager,
+			session_pool,
 			server_certs,
 			hdr_supported,
+			user_map,
 			shutdown: shutdown.clone(),
 		};
 
@@ -347,7 +367,10 @@ impl Webserver {
 
 		let response = if https {
 			match (request.method(), request.uri().path()) {
-				(&Method::GET, "/serverinfo") => self.server_info(params, local_address, mac_address, https).await,
+				(&Method::GET, "/serverinfo") => {
+					self.server_info(params, local_address, mac_address, https, &peer_cert_fingerprint)
+						.await
+				},
 				(&Method::GET, "/applist") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
@@ -381,19 +404,19 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
 					}
-					self.launch(params, local_address).await
+					self.launch(params, local_address, &peer_cert_fingerprint).await
 				},
 				(&Method::GET, "/resume") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
 					}
-					self.resume(params, local_address).await
+					self.resume(params, local_address, &peer_cert_fingerprint).await
 				},
 				(&Method::GET, "/cancel") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
 					}
-					self.cancel().await
+					self.cancel(&peer_cert_fingerprint).await
 				},
 				(method, uri) => {
 					tracing::warn!("Unhandled {method} request with URI '{uri}'");
@@ -402,7 +425,10 @@ impl Webserver {
 			}
 		} else {
 			match (request.method(), request.uri().path()) {
-				(&Method::GET, "/serverinfo") => self.server_info(params, local_address, mac_address, https).await,
+				(&Method::GET, "/serverinfo") => {
+					self.server_info(params, local_address, mac_address, https, &peer_cert_fingerprint)
+						.await
+				},
 				(&Method::GET, "/pair") => {
 					if !self.webserver_config.enable_pairing {
 						tracing::warn!("Pairing is disabled in configuration.");
@@ -551,15 +577,21 @@ impl Webserver {
 		local_address: Option<SocketAddr>,
 		mac_address: Option<String>,
 		https: bool,
+		peer_cert_fingerprint: &Option<String>,
 	) -> Response<Full<Bytes>> {
-		let session_context = match self.session_manager.get_session_context().await {
-			Ok(session_context) => session_context,
-			Err(()) => {
-				let message = "Failed to get session context".to_string();
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
+		// Per-client session state: a client sees BUSY (and its own currentgame)
+		// only for its own seat. Other clients see FREE while the pool has spare
+		// capacity, so each can launch its own concurrent session.
+		let own_seat = match peer_cert_fingerprint {
+			Some(_) => {
+				let owner = self.resolve_owner(peer_cert_fingerprint, &params);
+				self.session_pool.seat_info(&owner).await
+			}
+			None => None,
 		};
+		let has_capacity = self.session_pool.has_capacity().await;
+		let busy = own_seat.is_some() || !has_capacity;
+		let current_game = own_seat.map(|s| s.application_id).unwrap_or(0);
 
 		// Seems we should only say we paired when using HTTPS.
 		let paired = if https {
@@ -600,15 +632,14 @@ impl Webserver {
 		);
 		response += "<SupportedDisplayMode></SupportedDisplayMode>";
 		response += &format!("<PairStatus>{paired}</PairStatus>");
-		response += &format!(
-			"<currentgame>{}</currentgame>",
-			session_context.clone().map(|s| s.application_id).unwrap_or(0)
-		);
+		response += &format!("<currentgame>{current_game}</currentgame>");
 		response += &format!(
 			"<state>{}</state>",
-			session_context
-				.map(|_| "MOONSHINE_SERVER_BUSY")
-				.unwrap_or("MOONSHINE_SERVER_FREE")
+			if busy {
+				"MOONSHINE_SERVER_BUSY"
+			} else {
+				"MOONSHINE_SERVER_FREE"
+			}
 		);
 		response += "</root>";
 
@@ -703,6 +734,7 @@ impl Webserver {
 		&self,
 		mut params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
+		peer_cert_fingerprint: &Option<String>,
 	) -> Response<Full<Bytes>> {
 		let application_id = match params.remove("appid") {
 			Some(application_id) => application_id,
@@ -817,48 +849,41 @@ impl Webserver {
 			},
 		};
 
-		let initialize_result = self
-			.session_manager
-			.initialize_session(SessionContext {
-				application: application.clone(),
-				application_id,
-				resolution: (width, height),
-				refresh_rate,
-				keys: SessionKeys::new(remote_input_key, remote_input_key_id),
-				audio_channels,
-				audio_channel_mask,
-				hdr,
-			})
-			.await;
+		let owner = self.resolve_owner(peer_cert_fingerprint, &params);
+		// Surface the device fingerprint (and resolved user) so admins can map it
+		// under [[user]]. On the "onboarding" target so it shows by default; also
+		// covers devices paired before this logging existed.
+		tracing::info!(
+			target: "onboarding",
+			user = %owner,
+			device = %owner_key(peer_cert_fingerprint, &params),
+			"Launch requested; resolved seat owner."
+		);
+		let context = SessionContext {
+			application: application.clone(),
+			application_id,
+			resolution: (width, height),
+			refresh_rate,
+			keys: SessionKeys::new(remote_input_key, remote_input_key_id),
+			audio_channels,
+			audio_channel_mask,
+			hdr,
+			// Assigned by the pool from the reserved GPU slot at launch.
+			seat_home: None,
+		};
 
-		if initialize_result.is_err() {
-			return xml_error(400, "Failed to start session");
-		}
-
-		match tokio::time::timeout(
-			std::time::Duration::from_secs(APP_LAUNCH_HTTP_TIMEOUT_SECS),
-			self.session_manager.launch_session(),
-		)
-		.await
-		{
-			Ok(Ok(())) => {},
-			Ok(Err(())) => {
-				let _ = self.session_manager.stop_session().await;
+		let rtsp_port = match self.session_pool.launch(owner, context).await {
+			Ok(rtsp_port) => rtsp_port,
+			Err(LaunchError::NoGpuAvailable) => {
+				return xml_error(503, "No GPU available: the server is at capacity.");
+			},
+			Err(LaunchError::Failed) => {
 				return xml_error(
 					503,
 					"Application failed to start (check Moonshine logs for more information).",
 				);
 			},
-			Err(_) => {
-				tracing::error!("Timed out waiting for application launch result.");
-				// Clean up the partially-initialized session to allow retries.
-				let _ = self.session_manager.stop_session().await;
-				return xml_error(
-					503,
-					"Application failed to start (check Moonshine logs for more information).",
-				);
-			},
-		}
+		};
 
 		let mut response = "<root status_code=\"200\">".to_string();
 		response += "<gamesession>1</gamesession>";
@@ -866,7 +891,7 @@ impl Webserver {
 			response += &format!(
 				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
 				rtsp_host(addr.ip()),
-				self.rtsp_port
+				rtsp_port
 			);
 		}
 		response += "</root>";
@@ -883,6 +908,7 @@ impl Webserver {
 		&self,
 		mut params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
+		peer_cert_fingerprint: &Option<String>,
 	) -> Response<Full<Bytes>> {
 		let remote_input_key = match params.remove("rikey") {
 			Some(remote_input_key) => remote_input_key,
@@ -919,28 +945,32 @@ impl Webserver {
 			},
 		};
 
-		match self
-			.session_manager
-			.update_keys(SessionKeyData {
-				remote_input_key,
-				remote_input_key_id,
-			})
+		let owner = self.resolve_owner(peer_cert_fingerprint, &params);
+		let rtsp_port = match self
+			.session_pool
+			.resume(
+				&owner,
+				SessionKeyData {
+					remote_input_key,
+					remote_input_key_id,
+				},
+			)
 			.await
 		{
-			Ok(()) => {},
+			Ok(rtsp_port) => rtsp_port,
 			Err(()) => {
-				let message = "Failed to update session keys".to_string();
+				let message = "Failed to resume session: no active session for this client".to_string();
 				tracing::warn!("{message}");
 				return xml_error(400, &message);
 			},
-		}
+		};
 
 		let mut response = "<root status_code=\"200\">".to_string();
 		if let Some(addr) = local_address {
 			response += &format!(
 				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
 				rtsp_host(addr.ip()),
-				self.rtsp_port
+				rtsp_port
 			);
 		}
 		response += "<resume>1</resume>";
@@ -954,12 +984,9 @@ impl Webserver {
 		response
 	}
 
-	async fn cancel(&self) -> Response<Full<Bytes>> {
-		if self.session_manager.stop_session().await.is_err() {
-			let message = "Failed to stop session".to_string();
-			tracing::warn!("{message}");
-			return bad_request(message);
-		}
+	async fn cancel(&self, peer_cert_fingerprint: &Option<String>) -> Response<Full<Bytes>> {
+		let owner = self.resolve_owner(peer_cert_fingerprint, &HashMap::new());
+		self.session_pool.stop_owner(&owner).await;
 
 		let mut response = "<root status_code=\"200\">".to_string();
 		response += "<cancel>1</cancel>";
@@ -970,6 +997,18 @@ impl Webserver {
 			.headers_mut()
 			.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 		response
+	}
+
+	/// Resolve the seat owner for a request: the raw device identity (cert
+	/// fingerprint, or `uniqueid` on HTTP) mapped through the configured user
+	/// layer so a user's multiple devices share one owner. Unmapped devices keep
+	/// their own identity (device-pinned), preserving prior behavior.
+	fn resolve_owner(&self, peer_cert_fingerprint: &Option<String>, params: &HashMap<String, String>) -> String {
+		let device = owner_key(peer_cert_fingerprint, params);
+		match self.user_map.get(&device) {
+			Some(user) => user.clone(),
+			None => device,
+		}
 	}
 
 	/// Verify that the connecting client has presented a TLS certificate
@@ -1021,6 +1060,19 @@ fn unmap_v4_mapped(addr: SocketAddr) -> SocketAddr {
 		},
 		IpAddr::V4(_) => addr,
 	}
+}
+
+/// Derive a stable client identity for routing sessions in the pool. Prefers the
+/// mTLS certificate fingerprint (present on the protected HTTPS endpoints), and
+/// falls back to the `uniqueid` query parameter.
+fn owner_key(peer_cert_fingerprint: &Option<String>, params: &HashMap<String, String>) -> String {
+	if let Some(fingerprint) = peer_cert_fingerprint {
+		return fingerprint.clone();
+	}
+	params
+		.get("uniqueid")
+		.cloned()
+		.unwrap_or_else(|| "anonymous".to_string())
 }
 
 /// Format an IP address for use as the host part of an RTSP URL. IPv6 addresses

@@ -259,6 +259,8 @@ pub(crate) struct ControlStream {
 	stop: ShutdownManager<SessionShutdownReason>,
 	input_handler: InputHandler,
 	host: Host,
+	/// Actual bound UDP port (resolved when binding to port 0 for multi-seat).
+	local_port: u16,
 }
 
 impl ControlStream {
@@ -286,13 +288,26 @@ impl ControlStream {
 
 		let host = Host::new(host_config).map_err(|e| tracing::error!("Failed to create enet host: {e}"))?;
 
-		tracing::debug!("Listening for control messages on {:?}", socket_address);
+		// Resolve the actual bound port (ENet binds an ephemeral port when
+		// configured with port 0 for multi-seat sessions).
+		let local_port = host
+			.local_addr()
+			.map(|addr| addr.port())
+			.unwrap_or(config.port);
+
+		tracing::debug!("Listening for control messages on {}:{local_port}", socket_address.ip());
 
 		Ok(Self {
 			stop: stop_session_manager,
 			input_handler,
 			host,
+			local_port,
 		})
+	}
+
+	/// Actual bound UDP port, reported to the client via RTSP SETUP.
+	pub fn local_port(&self) -> u16 {
+		self.local_port
 	}
 
 	pub fn start(
@@ -307,6 +322,7 @@ impl ControlStream {
 			stop: stop_session_manager,
 			input_handler,
 			host,
+			local_port: _,
 		} = self;
 
 		tokio::spawn(async move {

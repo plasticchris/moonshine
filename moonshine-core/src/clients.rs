@@ -196,6 +196,14 @@ impl ClientManager {
 			self.state
 				.add_paired_cert(fp.clone())
 				.map_err(|_| tracing::warn!("Failed to persist paired certificate: {fp}"))?;
+			// Onboarding aid: this fingerprint is what goes in a [[user]] devices
+			// list to group multiple devices under one seat owner. Emitted on the
+			// dedicated "onboarding" target so it shows under the default (error)
+			// log filter.
+			tracing::info!(
+				target: "onboarding",
+				"Paired new device (uniqueid={id}). To share one profile/session across a person's devices, add this cert fingerprint to a [[user]] devices list in config.toml:\n    {fp}"
+			);
 		}
 
 		let has_client = self

@@ -11,8 +11,7 @@ use tracing_subscriber::EnvFilter;
 use moonshine_core::clients::ClientManager;
 use moonshine_core::config::Config;
 use moonshine_core::discovery::MdnsDiscovery;
-use moonshine_core::rtsp::RtspServer;
-use moonshine_core::session::manager::SessionManager;
+use moonshine_core::session::pool::SessionPool;
 use moonshine_core::webserver::Webserver;
 pub use moonshine_core::ShutdownReason;
 
@@ -31,7 +30,14 @@ async fn main() -> Result<(), ()> {
 		// Only color when stdout is a terminal: under systemd the escape codes
 		// make journald store every MESSAGE as a byte array instead of a string.
 		.with(tracing_subscriber::fmt::layer().with_ansi(std::io::stdout().is_terminal()))
-		.with(EnvFilter::try_from_env("MOONSHINE_LOG").unwrap_or_else(|_| EnvFilter::new("error")))
+		// smithay installs a process-wide EGL debug logger; Mesa's device
+		// enumeration during Vulkan encoder init trips a harmless
+		// eglQueryDevicesEXT BAD_ALLOC probe. Mute it so the default
+		// error-only view isn't dominated by this non-fatal noise.
+		.with(
+			EnvFilter::try_from_env("MOONSHINE_LOG")
+				.unwrap_or_else(|_| EnvFilter::new("error,onboarding=info,smithay::backend::egl::ffi=off")),
+		)
 		.init();
 
 	let mut config = Config::load_or_create(&args.config)?;
@@ -71,8 +77,7 @@ async fn main() -> Result<(), ()> {
 }
 
 pub struct Moonshine {
-	_rtsp_server: RtspServer,
-	_session_manager: SessionManager,
+	_session_pool: SessionPool,
 	_client_manager: ClientManager,
 	_webserver: Webserver,
 	_discovery: MdnsDiscovery,
@@ -83,40 +88,35 @@ impl Moonshine {
 	pub fn new(config: Config, shutdown: ShutdownManager<ShutdownReason>) -> Result<Self, ()> {
 		let (cert, pkey) = moonshine_core::tls::load_or_create_certificate(&config)?;
 
-		let session_manager = SessionManager::new(
+		// The session pool owns all concurrent seats, each with its own session
+		// manager and per-session RTSP server. In single-seat mode (no GPU pool
+		// configured) it hosts one session on the fixed config ports.
+		let session_pool = SessionPool::new(
 			config.compositor.clone(),
 			config.stream.video.clone(),
 			config.stream.audio.clone(),
 			config.stream.control.clone(),
 			config.address.clone(),
+			config.stream.port,
 			config.stream.timeout,
 			shutdown.clone(),
 		)?;
 		let client_manager = ClientManager::new(cert.clone(), pkey.clone())?;
 
 		Ok(Self {
-			_rtsp_server: RtspServer::new(
-				config.address.clone(),
-				config.stream.port,
-				config.stream.video.clone(),
-				config.stream.audio.clone(),
-				config.stream.control.clone(),
-				session_manager.clone(),
-				shutdown.clone(),
-			),
-			_session_manager: session_manager.clone(),
+			_session_pool: session_pool.clone(),
 			_client_manager: client_manager.clone(),
 			_webserver: Webserver::new(
 				config.name.clone(),
 				config.address.clone(),
-				config.stream.port,
 				config.webserver.clone(),
 				config.applications.clone(),
 				config.compositor.clone(),
 				client_manager.persistent_state().get_uuid()?.to_string(),
 				cert,
 				client_manager,
-				session_manager,
+				session_pool,
+				config.users.clone(),
 				shutdown.clone(),
 			)?,
 			_discovery: MdnsDiscovery::spawn(&config.address, config.webserver.port, &config.name),
